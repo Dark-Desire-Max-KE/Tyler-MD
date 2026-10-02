@@ -338,7 +338,7 @@ let connectedDevicesList = [
 
 apiRouter.post('/admin/login', (req, res) => {
   const { password } = req.body;
-  if (password === ADMIN_PASSWORD) {
+  if (typeof password === 'string' && password.trim() === ADMIN_PASSWORD) {
     baileysBot.addLog('success', 'Admin master access unlocked successfully');
     res.json({ success: true, token: 'tyler_admin_authenticated' });
   } else {

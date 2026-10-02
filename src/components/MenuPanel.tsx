@@ -52,7 +52,7 @@ export const MenuPanel: React.FC<MenuPanelProps> = ({
       <div className="bg-slate-950/80 border border-purple-500/30 rounded-2xl p-5 sm:p-6 shadow-[0_0_50px_rgba(168,85,247,0.15)] relative overflow-hidden backdrop-blur-xl">
         <div className="relative rounded-xl overflow-hidden border border-purple-500/40 mb-5 shadow-2xl group">
           <img
-            src="/src/assets/images/tyler_md_banner_1790893643188.jpg"
+            src="/images/tyler_md_banner_1790893643188.jpg"
             alt="Tyler MD Cyber Anime Girl Banner"
             referrerPolicy="no-referrer"
             className="w-full h-52 sm:h-72 object-cover object-center transform group-hover:scale-[1.01] transition-transform duration-500"

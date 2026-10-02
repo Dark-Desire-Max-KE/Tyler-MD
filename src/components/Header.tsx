@@ -84,7 +84,7 @@ export const Header: React.FC<HeaderProps> = ({
         <div className="flex items-center gap-3.5">
           <div className="h-10 w-10 rounded-xl overflow-hidden border border-purple-500/50 shadow-lg shadow-purple-950/50 relative shrink-0">
             <img
-              src="/src/assets/images/tyler_md_avatar_1790893655486.jpg"
+              src="/images/tyler_md_avatar_1790893655486.jpg"
               alt="Tyler MD"
               referrerPolicy="no-referrer"
               className="w-full h-full object-cover"

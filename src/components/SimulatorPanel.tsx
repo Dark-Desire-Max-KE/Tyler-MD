@@ -26,6 +26,9 @@ export const SimulatorPanel: React.FC<SimulatorPanelProps> = ({
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatHistory, isLoading]);
 
+  const getImageUrl = (url: string) =>
+    url.startsWith('/src/assets/') ? url.replace('/src/assets/', '/') : url;
+
   const handleSend = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!inputText.trim() || isLoading) return;
@@ -129,7 +132,7 @@ export const SimulatorPanel: React.FC<SimulatorPanelProps> = ({
           <div className="flex items-center gap-3">
             <div className="h-10 w-10 rounded-full overflow-hidden border border-purple-500/50 shadow-md shrink-0">
               <img
-                src="/src/assets/images/tyler_md_avatar_1790893655486.jpg"
+                src="/images/tyler_md_avatar_1790893655486.jpg"
                 alt="Tyler MD"
                 referrerPolicy="no-referrer"
                 className="w-full h-full object-cover"
@@ -202,7 +205,7 @@ export const SimulatorPanel: React.FC<SimulatorPanelProps> = ({
                   {isBot && (msg.replyType === 'image' || Boolean(msg.mediaUrl) || isMenuMessage) && (
                     <div className="mb-2.5 rounded-lg overflow-hidden border border-purple-500/40 shadow-lg">
                       <img
-                        src={msg.mediaUrl || (isMenuMessage ? '/src/assets/images/tyler_md_banner_1790893643188.jpg' : '/src/assets/images/anime_waifu_portrait_1790926081341.jpg')}
+                        src={getImageUrl(msg.mediaUrl || (isMenuMessage ? '/images/tyler_md_banner_1790893643188.jpg' : '/images/anime_waifu_portrait_1790926081341.jpg'))}
                         alt="Tyler MD Anime Response"
                         referrerPolicy="no-referrer"
                         className="w-full max-h-64 object-cover object-center"

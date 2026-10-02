@@ -200,7 +200,7 @@ export const PairingPanel: React.FC<PairingPanelProps> = ({
         <div className="inline-block relative">
           <div className="h-24 w-24 sm:h-28 sm:w-28 rounded-3xl overflow-hidden border-2 border-purple-500/50 shadow-[0_0_40px_rgba(168,85,247,0.3)] mx-auto relative group">
             <img
-              src="/src/assets/images/tyler_md_avatar_1790893655486.jpg"
+              src="/images/tyler_md_avatar_1790893655486.jpg"
               alt="Tyler MD"
               referrerPolicy="no-referrer"
               className="w-full h-full object-cover transform group-hover:scale-105 transition-transform duration-300"
