@@ -13,6 +13,7 @@ import { Boom } from '@hapi/boom';
 import { BotConfig, ConnectionStateInfo, BotLog } from '../types';
 import { sessionManager } from './sessionManager';
 import { securityManager } from './securityManager';
+import { moderationManager } from './moderationManager';
 import { autoReplyManager } from './autoReplyManager';
 import { pluginRegistry, CommandContext, toSansBold } from './pluginRegistry';
 import {
@@ -472,6 +473,19 @@ export class BaileysBotService {
       }
     }
 
+    if (isGroup && this.config.antiToxic && text) {
+      const matchedWord = moderationManager.findBadWord(senderJid, text);
+      if (matchedWord) {
+        try {
+          await this.sock.sendMessage(senderJid, { delete: msg.key });
+          this.addLog('security', `Filtered configured group word from @${senderNumber}.`);
+        } catch (error: any) {
+          this.addLog('warn', `Could not delete filtered message: ${error.message}`);
+        }
+        return;
+      }
+    }
+
     // 2. Anti-Spam rate limiting
     if (this.config.antiSpam) {
       const spamCheck = securityManager.checkSpam(participantJid);
@@ -562,17 +576,17 @@ export class BaileysBotService {
 
       // The paired user is 100% the Admin & Owner with unrestricted access
       const isFromMe = Boolean(msg.key?.fromMe);
-      const pairedNum = this.phoneNumber ? this.phoneNumber.replace(/[^0-9]/g, '') : '';
-      const ownerConfigNum = this.config.ownerNumber ? this.config.ownerNumber.replace(/[^0-9]/g, '') : '';
-      const cleanSender = senderNumber.replace(/[^0-9]/g, '');
+      const normalizeJidUser = (jid?: string) => (jid || '').split('@')[0].split(':')[0];
+      const pairedNum = normalizeJidUser(this.phoneNumber).replace(/[^0-9]/g, '');
+      const ownerConfigNum = normalizeJidUser(this.config.ownerNumber).replace(/[^0-9]/g, '');
+      const cleanSender = normalizeJidUser(participantJid).replace(/[^0-9]/g, '');
 
       const isOwner = Boolean(
         isFromMe ||
-        (pairedNum && cleanSender.includes(pairedNum)) ||
-        (ownerConfigNum && cleanSender.includes(ownerConfigNum)) ||
-        (this.userJid && participantJid.split('@')[0].split(':')[0] === this.userJid.split('@')[0].split(':')[0])
+        (pairedNum && cleanSender === pairedNum) ||
+        (ownerConfigNum && cleanSender === ownerConfigNum) ||
+        (this.userJid && normalizeJidUser(participantJid) === normalizeJidUser(this.userJid))
       );
-      const isAdmin = Boolean(isOwner || !isGroup);
 
       // Work mode: if self mode, ignore if not owner
       if (this.config.workMode === 'self' && !isOwner) {
@@ -590,6 +604,15 @@ export class BaileysBotService {
         } catch (e) {}
       }
 
+      const groupParticipants = Array.isArray(groupMetadata?.participants) ? groupMetadata.participants : [];
+      const isAdmin = isOwner || groupParticipants.some((participant: any) =>
+        normalizeJidUser(participant.id) === normalizeJidUser(participantJid) && Boolean(participant.admin)
+      );
+      const botJid = this.sock?.user?.id || this.userJid;
+      const isBotAdmin = groupParticipants.some((participant: any) =>
+        normalizeJidUser(participant.id) === normalizeJidUser(botJid) && Boolean(participant.admin)
+      );
+
       const cmdCtx: CommandContext = {
         sock: this.sock,
         msg,
@@ -600,8 +623,8 @@ export class BaileysBotService {
         groupJid: isGroup ? senderJid : undefined,
         groupName: isGroup ? groupSubject : undefined,
         groupMetadata,
-        isAdmin: true,
-        isBotAdmin: true,
+        isAdmin,
+        isBotAdmin,
         isOwner,
         command: commandName,
         args,

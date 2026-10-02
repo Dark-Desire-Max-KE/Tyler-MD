@@ -1,5 +1,10 @@
+import { createHash } from 'node:crypto';
+import { availableParallelism } from 'node:os';
 import { PluginCommand, BotConfig } from '../types';
 import { ADDITIONAL_COMMANDS_DATA } from './commandsData';
+import { autoReplyManager } from './autoReplyManager';
+import { securityManager } from './securityManager';
+import { moderationManager } from './moderationManager';
 
 /**
  * Transforms text into Sans-Serif Ultra Bold Condensed typography (Mathematical Sans-Serif Bold Unicode).
@@ -56,6 +61,391 @@ export interface CommandResult {
 }
 
 type CommandExecutor = (ctx: CommandContext) => Promise<CommandResult> | CommandResult;
+
+function getGroupTargets(ctx: CommandContext): string[] {
+  const message = ctx.msg?.message || {};
+  const contextInfo = message.extendedTextMessage?.contextInfo ||
+    message.imageMessage?.contextInfo ||
+    message.videoMessage?.contextInfo ||
+    message.documentMessage?.contextInfo;
+  const mentionedJids = Array.isArray(contextInfo?.mentionedJid) ? contextInfo.mentionedJid : [];
+  const quotedJid = contextInfo?.participant;
+  const directJids = [...mentionedJids, ...(quotedJid ? [quotedJid] : [])]
+    .filter((jid): jid is string => typeof jid === 'string' && /^[\w.-]+@(s\.whatsapp\.net|lid)$/.test(jid));
+  if (directJids.length) return [...new Set(directJids)];
+
+  const target = ctx.args[0] || '';
+  if (/^[\w.-]+@(s\.whatsapp\.net|lid)$/.test(target)) return [target];
+  const digits = target.replace(/\D/g, '');
+  return digits.length >= 6 ? [`${digits}@s.whatsapp.net`] : [];
+}
+
+async function executeLiveGroupCommand(commandName: string, ctx: CommandContext): Promise<CommandResult | null> {
+  const operations = new Set([
+    'add', 'kick', 'remove', 'ban', 'promote', 'demote', 'groupopen', 'groupclose', 'openchat', 'closechat',
+    'mute', 'unmute', 'lockgroup', 'unlockgroup', 'setname', 'setdesc', 'resetlink', 'resetgclink'
+  ]);
+  const reads = new Set([
+    'link', 'gclink', 'grouplink', 'invitelink', 'groupinfo', 'ginfo', 'infogc', 'admins', 'groupid',
+    'membercount', 'admincount', 'getdesc', 'gcsettings', 'grouplist', 'checkadmin', 'tagme', 'tagall',
+    'everyone', 'all', 'mentionall', 'hidetag', 'htag', 'totag', 'pingadmins'
+  ]);
+  if (!operations.has(commandName) && !reads.has(commandName)) return null;
+
+  const { sock, groupJid } = ctx;
+  if (!sock || !groupJid?.endsWith('@g.us')) {
+    return { replyText: 'This command requires an active WhatsApp group connection; it cannot change groups from the simulator.' };
+  }
+
+  const metadata = ctx.groupMetadata || await sock.groupMetadata(groupJid);
+  const participants = Array.isArray(metadata?.participants) ? metadata.participants : [];
+  const requiresBotAdmin = operations.has(commandName);
+  if (requiresBotAdmin && !ctx.isBotAdmin) {
+    return { replyText: 'The bot must be a group administrator to perform this action.' };
+  }
+
+  if (['add', 'kick', 'remove', 'ban', 'promote', 'demote'].includes(commandName)) {
+    const targets = getGroupTargets(ctx);
+    if (!targets.length) {
+      return { replyText: `Usage: ${ctx.config.prefix}${commandName} @mention, reply to a member, or provide a full phone number.` };
+    }
+    const action = ['kick', 'remove', 'ban'].includes(commandName) ? 'remove' : commandName;
+    const results = await sock.groupParticipantsUpdate(groupJid, targets, action);
+    const failed = Array.isArray(results) ? results.filter((result: any) => result.status && String(result.status) !== '200') : [];
+    if (failed.length) {
+      return { replyText: `WhatsApp could not complete the action for ${failed.map((result: any) => result.jid || 'a participant').join(', ')}. Check that the bot has permission and the targets are eligible.` };
+    }
+    return { replyText: `WhatsApp accepted the ${action} request for ${targets.map(jid => `@${jid.split('@')[0]}`).join(', ')}.`, mentions: targets };
+  }
+
+  if (['groupopen', 'openchat', 'unmute', 'groupclose', 'closechat', 'mute', 'lockgroup', 'unlockgroup'].includes(commandName)) {
+    const setting = ['groupopen', 'openchat', 'unmute'].includes(commandName)
+      ? 'not_announcement'
+      : ['groupclose', 'closechat', 'mute'].includes(commandName)
+        ? 'announcement'
+        : commandName === 'lockgroup' ? 'locked' : 'unlocked';
+    await sock.groupSettingUpdate(groupJid, setting);
+    const label = setting === 'not_announcement' ? 'opened' : setting === 'announcement' ? 'closed to members' : setting;
+    return { replyText: `Group settings updated: the group is now ${label}.` };
+  }
+
+  if (commandName === 'setname') {
+    const subject = ctx.args.join(' ').trim();
+    if (!subject) return { replyText: `Usage: ${ctx.config.prefix}setname <new group name>` };
+    await sock.groupUpdateSubject(groupJid, subject);
+    return { replyText: `Group name updated to *${subject}*.` };
+  }
+
+  if (commandName === 'setdesc') {
+    const description = ctx.args.join(' ').trim();
+    if (!description) return { replyText: `Usage: ${ctx.config.prefix}setdesc <new description>` };
+    await sock.groupUpdateDescription(groupJid, description);
+    return { replyText: 'Group description updated.' };
+  }
+
+  if (['link', 'gclink', 'grouplink', 'invitelink', 'resetlink', 'resetgclink'].includes(commandName)) {
+    if (['resetlink', 'resetgclink'].includes(commandName)) await sock.groupRevokeInvite(groupJid);
+    const code = await sock.groupInviteCode(groupJid);
+    return { replyText: `Group invite link: https://chat.whatsapp.com/${code}` };
+  }
+
+  if (['groupinfo', 'ginfo', 'infogc', 'membercount', 'admincount', 'groupid', 'getdesc', 'gcsettings', 'grouplist'].includes(commandName)) {
+    const admins = participants.filter((participant: any) => participant.admin);
+    if (commandName === 'membercount' || commandName === 'grouplist') return { replyText: `${metadata.subject || ctx.groupName || 'Group'} has ${participants.length} participants.` };
+    if (commandName === 'admincount') return { replyText: `${admins.length} group administrators.` };
+    if (commandName === 'groupid') return { replyText: `Group ID: ${groupJid}` };
+    if (commandName === 'getdesc') return { replyText: metadata.desc || 'This group has no description.' };
+    if (commandName === 'gcsettings') return { replyText: `Announcement-only: ${metadata.announce ? 'yes' : 'no'}\nLocked group info: ${metadata.restrict ? 'yes' : 'no'}` };
+    return { replyText: `*${metadata.subject || ctx.groupName || 'Group'}*\nParticipants: ${participants.length}\nAdmins: ${admins.length}\nCreated: ${metadata.creation ? new Date(metadata.creation * 1000).toLocaleString() : 'unknown'}\nDescription: ${metadata.desc || 'none'}` };
+  }
+
+  const selectedParticipants: string[] = commandName === 'tagme' || commandName === 'totag'
+    ? getGroupTargets(ctx).slice(0, 1)
+    : commandName === 'admins' || commandName === 'pingadmins'
+      ? participants.filter((participant: any) => participant.admin).map((participant: any) => participant.id)
+      : participants.map((participant: any) => participant.id);
+  if (!selectedParticipants.length) return { replyText: 'No matching group participants were found.' };
+  const note = ctx.args.join(' ').trim();
+  const heading = commandName === 'tagme' ? 'You requested a mention:' : commandName === 'admins' ? 'Group administrators:' : commandName === 'pingadmins' ? (note || 'Admin attention requested:') : (note || 'Group announcement:');
+  return { replyText: `${heading}\n${selectedParticipants.map(jid => `@${jid.split('@')[0]}`).join(' ')}`, mentions: selectedParticipants };
+}
+
+async function executeCatalogCommand(
+  name: string,
+  category: PluginCommand['category'],
+  description: string,
+  ctx: CommandContext
+): Promise<CommandResult | null> {
+  const input = ctx.args.join(' ').trim();
+
+  if (category === 'autoreply') {
+    if (['autoreply', 'autoreplylist', 'responderstatus'].includes(name)) {
+      const rules = autoReplyManager.getRules();
+      if (!rules.length) return { replyText: 'No auto-reply rules are configured.' };
+      return { replyText: rules.map(rule => `${rule.enabled ? 'ON' : 'OFF'} ${rule.id}: ${rule.matchType} "${rule.trigger}" -> ${rule.response}`).join('\n') };
+    }
+    if (name === 'autoreplyadd') {
+      const [trigger, ...responseParts] = input.split('|');
+      const response = responseParts.join('|').trim();
+      if (!trigger?.trim() || !response) return { replyText: `Usage: ${ctx.config.prefix}autoreplyadd <trigger>|<response>` };
+      const rule = autoReplyManager.addRule({ trigger: trigger.trim(), matchType: 'contains', response, enabled: true });
+      return { replyText: `Auto-reply rule ${rule.id} added.` };
+    }
+    if (name === 'autoreplydel') {
+      const ruleId = ctx.args[0];
+      if (!ruleId) return { replyText: `Usage: ${ctx.config.prefix}autoreplydel <id>` };
+      return { replyText: autoReplyManager.deleteRule(ruleId) ? `Auto-reply rule ${ruleId} deleted.` : `Auto-reply rule ${ruleId} was not found.` };
+    }
+    if (name === 'autoreplyclear' || name === 'clearautomation') {
+      const removed = autoReplyManager.clearCustomRules();
+      if (name === 'clearautomation') {
+        ctx.config.autoRead = false;
+        ctx.config.autoTyping = false;
+        ctx.config.autoReact = false;
+      }
+      return { replyText: `Removed ${removed} custom auto-reply rule${removed === 1 ? '' : 's'}${name === 'clearautomation' ? ' and disabled auto-read, typing, and reactions' : ''}.` };
+    }
+    if (name === 'autoblue') {
+      const mode = ctx.args[0]?.toLowerCase();
+      if (!['on', 'off'].includes(mode || '')) return { replyText: `Usage: ${ctx.config.prefix}autoblue on|off` };
+      ctx.config.autoRead = mode === 'on';
+      return { replyText: `Auto-read is now ${ctx.config.autoRead ? 'on' : 'off'}.` };
+    }
+    if (name === 'autoreactemoji') {
+      const emoji = ctx.args[0];
+      if (!emoji) return { replyText: `Usage: ${ctx.config.prefix}autoreactemoji <emoji>` };
+      ctx.config.autoReactEmoji = emoji;
+      ctx.config.autoReact = true;
+      return { replyText: `Automatic reactions now use ${emoji}.` };
+    }
+    if (name === 'autoonline' || name.startsWith('presence')) {
+      if (!ctx.sock?.sendPresenceUpdate) return { replyText: 'Presence commands require an active WhatsApp connection.' };
+      const presenceByCommand: Record<string, string> = {
+        presencecomposing: 'composing', presencerecording: 'recording', presencepaused: 'paused', presencereset: 'available'
+      };
+      const mode = ctx.args[0]?.toLowerCase();
+      const presence = name === 'autoonline' ? (mode === 'off' ? 'unavailable' : 'available') : presenceByCommand[name];
+      await ctx.sock.sendPresenceUpdate(presence, name === 'autoonline' ? undefined : (ctx.isGroup ? ctx.groupJid : ctx.senderJid));
+      return { replyText: `WhatsApp presence set to ${presence}.` };
+    }
+    if (name === 'testautoreply') {
+      if (!input) return { replyText: `Usage: ${ctx.config.prefix}testautoreply <message>` };
+      const match = autoReplyManager.matchMessage(input, {
+        isGroup: ctx.isGroup,
+        pushName: ctx.senderName,
+        userJid: ctx.senderJid,
+        groupName: ctx.groupName,
+        botName: ctx.config.botName,
+        ownerName: ctx.config.ownerName,
+        ownerNumber: ctx.config.ownerNumber
+      });
+      return { replyText: match.matched ? match.interpolatedReply || 'A rule matched with an empty response.' : 'No enabled rule matches that message.' };
+    }
+    return { replyText: `The ${name} automation is not connected to a runtime worker yet.` };
+  }
+
+  if (category === 'security') {
+    const configKey: Record<string, keyof BotConfig> = {
+      bugshield: 'antiBug', 'bidi-protect': 'antiBug', 'zerowidth-filter': 'antiBug',
+      'vcard-guard': 'antiBug', ratelimit: 'antiSpam', antispamgc: 'antiSpam',
+      antitoxic: 'antiToxic', 'antidemote': 'antiDemote', antibug: 'antiBug',
+      antidelete: 'antiDelete', antilink: 'antiLink'
+    };
+    const key = configKey[name];
+    if (key) {
+      const mode = ctx.args[0]?.toLowerCase();
+      if (mode === 'on' || mode === 'enable') ctx.config[key] = true as never;
+      if (mode === 'off' || mode === 'disable') ctx.config[key] = false as never;
+      return { replyText: `${name} is ${ctx.config[key] ? 'enabled' : 'disabled'}${['bidi-protect', 'zerowidth-filter', 'vcard-guard'].includes(name) ? ' with the shared anti-bug filter' : ''}.` };
+    }
+    if (['crashshield', 'shieldstatus', 'guardstatus'].includes(name)) {
+      return { replyText: `Security status: anti-bug ${ctx.config.antiBug ? 'on' : 'off'}, anti-link ${ctx.config.antiLink ? 'on' : 'off'}, anti-spam ${ctx.config.antiSpam ? 'on' : 'off'}, anti-delete ${ctx.config.antiDelete ? 'on' : 'off'}, anti-toxic ${ctx.config.antiToxic ? 'on' : 'off'}.` };
+    }
+    if (name === 'verifyarmor') {
+      const result = securityManager.analyzeForBugs('normal security verification message');
+      return { replyText: `Security analyzer test ${result.isBug ? 'failed' : 'passed'}.` };
+    }
+    if (name === 'clearmalware') {
+      securityManager.clearMessageCache();
+      return { replyText: 'In-memory message and rate-limit caches cleared.' };
+    }
+    return { replyText: `The ${name} security action is not implemented and was not applied.` };
+  }
+
+  if (category === 'moderation') {
+    if (!ctx.isGroup || !ctx.groupJid) return { replyText: 'Moderation commands require a group chat.' };
+    if (['badwords', 'addbadword', 'delbadword'].includes(name)) {
+      if (name === 'badwords') {
+        const words = moderationManager.listBadWords(ctx.groupJid);
+        return { replyText: words.length ? `Filtered words: ${words.join(', ')}` : 'No group-specific filtered words are configured.' };
+      }
+      const word = ctx.args.join(' ').trim();
+      if (!word) return { replyText: `Usage: ${ctx.config.prefix}${name} <word>` };
+      const changed = name === 'addbadword'
+        ? moderationManager.addBadWord(ctx.groupJid, word)
+        : moderationManager.removeBadWord(ctx.groupJid, word);
+      return { replyText: changed ? `Filtered word ${name === 'addbadword' ? 'added' : 'removed'}.` : `Filtered word was not ${name === 'addbadword' ? 'added (already present or invalid)' : 'found'}.` };
+    }
+
+    if (['warn', 'warn1', 'warn2', 'warncheck', 'warnreset', 'unwarnall', 'delwarn'].includes(name)) {
+      const target = getGroupTargets(ctx)[0];
+      if (!target) return { replyText: `Usage: ${ctx.config.prefix}${name} @mention or reply to a member.` };
+      if (['warncheck'].includes(name)) {
+        const warning = moderationManager.getWarning(ctx.groupJid, target);
+        return { replyText: `@${target.split('@')[0]} has ${warning.count}/${moderationManager.getWarningLimit(ctx.groupJid)} warnings. ${warning.reasons.slice(-1)[0] || ''}`, mentions: [target] };
+      }
+      if (['warnreset', 'unwarnall', 'delwarn'].includes(name)) {
+        const removed = moderationManager.clearWarning(ctx.groupJid, target);
+        return { replyText: removed ? `Warnings cleared for @${target.split('@')[0]}.` : `No warning record exists for @${target.split('@')[0]}.`, mentions: [target] };
+      }
+      const reason = ctx.args.slice(1).join(' ').trim() || 'Group rules violation';
+      const amount = name === 'warn2' ? 2 : 1;
+      const warning = moderationManager.addWarning(ctx.groupJid, target, reason, amount);
+      const limit = moderationManager.getWarningLimit(ctx.groupJid);
+      if (warning.count >= limit && ctx.sock && ctx.isBotAdmin) {
+        await ctx.sock.groupParticipantsUpdate(ctx.groupJid, [target], 'remove');
+        moderationManager.clearWarning(ctx.groupJid, target);
+        return { replyText: `@${target.split('@')[0]} reached ${limit} warnings and was removed from the group.`, mentions: [target] };
+      }
+      return { replyText: `Warning recorded for @${target.split('@')[0]} (${warning.count}/${limit}): ${reason}`, mentions: [target] };
+    }
+
+    if (['warnlist', 'modlog'].includes(name)) {
+      const warnings = moderationManager.listWarnings(ctx.groupJid);
+      return { replyText: warnings.length
+        ? warnings.map(item => `@${item.participantJid.split('@')[0]}: ${item.count} (${item.reasons.slice(-1)[0] || 'no reason'})`).join('\n')
+        : 'No warnings are recorded for this group.', mentions: warnings.map(item => item.participantJid) };
+    }
+    if (name === 'clearwarns') {
+      moderationManager.clearGroupWarnings(ctx.groupJid);
+      return { replyText: 'All warning records for this group were cleared.' };
+    }
+    if (name === 'setwarnlimit') {
+      const limit = Number(ctx.args[0]);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 20) return { replyText: `Usage: ${ctx.config.prefix}setwarnlimit <1-20>` };
+      moderationManager.setWarningLimit(ctx.groupJid, limit);
+      return { replyText: `The warning limit is now ${limit}.` };
+    }
+    return { replyText: `The ${name} moderation action is not implemented and was not applied.` };
+  }
+
+  if (category === 'ai') {
+    if (!input && !['joke', 'riddle', 'quote', 'compliment', 'roastme', 'proverb', 'haiku'].includes(name)) {
+      return { replyText: `Usage: ${ctx.config.prefix}${name} <prompt>` };
+    }
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+      return { replyText: 'AI service is not configured. Set GEMINI_API_KEY in the server environment.' };
+    }
+    try {
+      const { GoogleGenAI } = await import('@google/genai');
+      const ai = new GoogleGenAI({ apiKey });
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: `${description}\n\nUser input: ${input || 'Generate one appropriate response.'}`,
+        config: { systemInstruction: `You are the ${name} command for ${ctx.config.botName}. Perform the requested task directly, be accurate, concise, and do not claim external actions.` }
+      });
+      return { replyText: response.text || 'The AI service returned an empty response.' };
+    } catch (error) {
+      console.error(`AI command ${name} failed:`, error);
+      return { replyText: 'The AI request failed. Check the Gemini key, quota, and server logs.' };
+    }
+  }
+
+  if (category === 'tools') {
+    if (['math', 'mathsolver'].includes(name)) {
+      if (!input || !/^[\d+\-*/().\s%^]+$/.test(input)) return { replyText: `Usage: ${ctx.config.prefix}${name} <arithmetic expression>` };
+      try {
+        const value = Function(`"use strict"; return (${input.replace(/\^/g, '**')});`)();
+        if (!Number.isFinite(value)) return { replyText: 'The expression did not produce a finite number.' };
+        return { replyText: `${input} = ${value}` };
+      } catch {
+        return { replyText: 'Invalid arithmetic expression.' };
+      }
+    }
+    if (['base64enc', 'base64dec'].includes(name)) {
+      if (!input) return { replyText: `Usage: ${ctx.config.prefix}${name} <text>` };
+      if (name === 'base64enc') return { replyText: Buffer.from(input, 'utf8').toString('base64') };
+      try {
+        const decoded = Buffer.from(input, 'base64').toString('utf8');
+        if (Buffer.from(decoded, 'utf8').toString('base64').replace(/=+$/, '') !== input.replace(/=+$/, '')) throw new Error('Invalid Base64');
+        return { replyText: decoded };
+      } catch {
+        return { replyText: 'Input is not valid Base64.' };
+      }
+    }
+    if (['urlencode', 'urldecode'].includes(name)) {
+      if (!input) return { replyText: `Usage: ${ctx.config.prefix}${name} <text>` };
+      try {
+        return { replyText: name === 'urlencode' ? encodeURIComponent(input) : decodeURIComponent(input) };
+      } catch {
+        return { replyText: 'Input contains invalid URL encoding.' };
+      }
+    }
+    if (['hash', 'md5', 'sha256'].includes(name)) {
+      const algorithm = name === 'hash' ? ctx.args[0]?.toLowerCase() : name;
+      const text = name === 'hash' ? ctx.args.slice(1).join(' ') : input;
+      if (!algorithm || !text) return { replyText: `Usage: ${ctx.config.prefix}${name} [algorithm] <text>` };
+      try {
+        return { replyText: createHash(algorithm).update(text).digest('hex') };
+      } catch {
+        return { replyText: `Unsupported hash algorithm: ${algorithm}` };
+      }
+    }
+    if (['binaryenc', 'binarydec'].includes(name)) {
+      if (!input) return { replyText: `Usage: ${ctx.config.prefix}${name} <text>` };
+      if (name === 'binaryenc') return { replyText: [...Buffer.from(input)].map(byte => byte.toString(2).padStart(8, '0')).join(' ') };
+      const bits = input.replace(/\s+/g, '');
+      if (!/^(?:[01]{8})+$/.test(bits)) return { replyText: 'Binary input must contain complete 8-bit bytes.' };
+      return { replyText: Buffer.from(bits.match(/.{8}/g)!.map(byte => parseInt(byte, 2))).toString('utf8') };
+    }
+    if (name === 'hexrgb') {
+      const match = /^#?([\da-f]{6})$/i.exec(input);
+      if (!match) return { replyText: `Usage: ${ctx.config.prefix}hexrgb #38bdf8` };
+      const hex = match[1];
+      return { replyText: `RGB(${parseInt(hex.slice(0, 2), 16)}, ${parseInt(hex.slice(2, 4), 16)}, ${parseInt(hex.slice(4, 6), 16)})` };
+    }
+    if (['time', 'date', 'timezone', 'clock'].includes(name)) {
+      const now = new Date();
+      return { replyText: name === 'date' ? now.toLocaleDateString() : name === 'timezone' ? Intl.DateTimeFormat().resolvedOptions().timeZone : now.toLocaleString() };
+    }
+    if (['runtime', 'uptime', 'uptime2'].includes(name)) {
+      const seconds = Math.floor(process.uptime());
+      return { replyText: `Process uptime: ${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m ${seconds % 60}s.` };
+    }
+    if (['ram', 'memoryreport'].includes(name)) {
+      const memory = process.memoryUsage();
+      return { replyText: `RSS ${(memory.rss / 1048576).toFixed(1)} MB; heap ${(memory.heapUsed / 1048576).toFixed(1)} / ${(memory.heapTotal / 1048576).toFixed(1)} MB.` };
+    }
+    if (['cpu', 'system', 'serverinfo', 'systeminfo'].includes(name)) {
+      return { replyText: `${process.platform} ${process.arch}; Node ${process.version}; ${availableParallelism()} CPU threads.` };
+    }
+    if (name === 'dnslookup') {
+      if (!input) return { replyText: `Usage: ${ctx.config.prefix}dnslookup <domain>` };
+      try {
+        const { resolve4 } = await import('node:dns/promises');
+        return { replyText: (await resolve4(input)).join('\n') };
+      } catch {
+        return { replyText: `No IPv4 DNS records found for ${input}.` };
+      }
+    }
+    if (['npm', 'pypi'].includes(name)) {
+      if (!input) return { replyText: `Usage: ${ctx.config.prefix}${name} <package>` };
+      try {
+        const url = name === 'npm' ? `https://registry.npmjs.org/${encodeURIComponent(input)}` : `https://pypi.org/pypi/${encodeURIComponent(input)}/json`;
+        const response = await fetch(url, { signal: AbortSignal.timeout(8000) });
+        if (!response.ok) return { replyText: `${name} package "${input}" was not found.` };
+        const data: any = await response.json();
+        return { replyText: `${data.name || data.info?.name} ${data['dist-tags']?.latest || data.info?.version}\n${data.description || data.info?.summary || ''}` };
+      } catch {
+        return { replyText: 'Package registry lookup failed. Try again later.' };
+      }
+    }
+    return { replyText: `The ${name} tool is not implemented and was not run.` };
+  }
+
+  return null;
+}
 
 export class PluginRegistry {
   private plugins: Map<string, PluginCommand> = new Map();
@@ -157,6 +547,9 @@ export class PluginRegistry {
     if (plugin.adminOnly && !ctx.isAdmin && !ctx.isOwner) {
       return { replyText: `👮 *Admin Permission Required*: You must be a group administrator to run this command.` };
     }
+
+    const groupResult = await executeLiveGroupCommand(commandName.toLowerCase(), ctx);
+    if (groupResult) return groupResult;
 
     plugin.executionCount = (plugin.executionCount || 0) + 1;
     const executor = this.executors.get(plugin.name.toLowerCase());
@@ -776,41 +1169,8 @@ export class PluginRegistry {
       aliases: ['gemini', 'gpt', 'ask'],
       enabled: true
     }, async (ctx) => {
-      const prompt = ctx.args.join(' ');
-      if (!prompt) {
-        return { replyText: `🤖 *Usage*: ${ctx.config.prefix}ai <your prompt or question>` };
-      }
-
-      // Try Gemini API if key is present
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (apiKey && apiKey !== 'MY_GEMINI_API_KEY') {
-        try {
-          const { GoogleGenAI } = await import('@google/genai');
-          const ai = new GoogleGenAI({ apiKey });
-          const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: prompt,
-            config: {
-              systemInstruction: `You are the AI assistant inside ${ctx.config.botName}, a WhatsApp MD bot. Keep answers concise, informative, well-formatted with WhatsApp markdown (*bold*, _italic_, code blocks).`
-            }
-          });
-          return {
-            replyText: `🧠 *${ctx.config.botName} AI Assistant*:\n\n${response.text || 'No response generated.'}`
-          };
-        } catch (err: any) {
-          console.warn('Gemini API call failed, falling back to simulated intelligent response:', err.message);
-        }
-      }
-
-      // High quality fallback response if API key not yet configured
-      return {
-        replyText: `🧠 *${ctx.config.botName} AI Assistant*:\n\n` +
-          `Regarding: *"${prompt}"*\n\n` +
-          `Here is an analytical breakdown:\n` +
-          `• *Core Concept*: Rapidly expanding modern architecture leveraging asynchronous event loops.\n` +
-          `• *Key Advantage*: Zero-downtime multi-device sockets with modular Baileys transport.\n` +
-          `• *Recommended Next Step*: Test dynamic command chaining with *${ctx.config.prefix}menu*.\n\n` +
-          `_(Powered by Gemini Engine)_`
+      return await executeCatalogCommand('ai', 'ai', 'Answer the user question directly.', ctx) || {
+        replyText: 'AI handler unavailable.'
       };
     });
 
@@ -1371,101 +1731,11 @@ export class PluginRegistry {
           return { replyText: cmd.generateResponse(ctx) };
         }
 
+        const implementedResult = await executeCatalogCommand(cmd.name, cmd.category, cmd.description, ctx);
+        if (implementedResult) return implementedResult;
+
         const argsText = ctx.args.join(' ');
-        let reply = '';
-
-        switch (cmd.category) {
-          case 'anime':
-            const isImage = [
-              'waifu', 'neko', 'shinobu', 'megumin', 'anime', 'cosplay', 'wallpaper',
-              'husbando', 'kiss', 'hug', 'pat', 'slap', 'punch', 'cuddle', 'smile',
-              'wink', 'blush', 'bonk', 'yeet', 'poke', 'kill'
-            ].includes(cmd.name.toLowerCase());
-
-            let imgUrl = '/src/assets/images/anime_waifu_portrait_1790926081341.jpg';
-            if (cmd.name.toLowerCase() === 'neko') {
-              imgUrl = '/src/assets/images/anime_neko_girl_1790926094923.jpg';
-            } else if (cmd.name.toLowerCase() === 'wallpaper' || cmd.name.toLowerCase() === 'anime') {
-              imgUrl = '/src/assets/images/tyler_md_banner_1790893643188.jpg';
-            }
-
-            reply = `🌸 *[${toSansBold('TYLER MD ANIME')}]* ${cmd.description}\n\n` +
-              `• *${toSansBold('Action')}*: Executed ${ctx.config.prefix}${toSansBold(cmd.name)}\n` +
-              `• *${toSansBold('Target')}*: ${argsText || '@' + ctx.senderNumber}\n` +
-              `• *${toSansBold('Status')}*: Delivered with high-detail visual reaction! ✨`;
-
-            if (isImage) {
-              return {
-                replyText: reply,
-                replyType: 'image',
-                mediaUrl: imgUrl,
-                caption: reply
-              };
-            }
-            break;
-
-          case 'stickers':
-            reply = `🎨 *[${toSansBold('STICKER STUDIO')}]* ${cmd.description}\n\n` +
-              `• *${toSansBold('Module')}*: Tyler MD Graphics Engine\n` +
-              `• *${toSansBold('Filter')}*: ${toSansBold(cmd.name.toUpperCase())}\n` +
-              `• *${toSansBold('Author')}*: Tyler MD\n` +
-              `• *${toSansBold('Status')}*: EXIF chunk rendered successfully! ✅`;
-            break;
-
-          case 'media':
-            reply = `📥 *[${toSansBold('MEDIA RESOLVER')}]* ${cmd.description}\n\n` +
-              `• *${toSansBold('Query')}*: ${argsText || 'Trending Stream'}\n` +
-              `• *${toSansBold('Format')}*: High Bitrate Stream (320kbps / 1080p)\n` +
-              `• *${toSansBold('Engine')}*: Baileys Pipe v5.0\n` +
-              `• *${toSansBold('Status')}*: Extracted and buffered for playback.`;
-            break;
-
-          case 'moderation':
-            reply = `⚖️ *[${toSansBold('MODERATION GUARD')}]* ${cmd.description}\n\n` +
-              `• *${toSansBold('Action')}*: ${toSansBold(cmd.name.toUpperCase())}\n` +
-              `• *${toSansBold('Target')}*: ${argsText || 'Group Chat'}\n` +
-              `• *${toSansBold('Enforced By')}*: @${ctx.senderNumber} (${ctx.isAdmin ? 'Admin' : 'Owner'})\n` +
-              `• *${toSansBold('Policy')}*: Strictly enforced.`;
-            break;
-
-          case 'security':
-            reply = `🛡️ *[${toSansBold('WARFARE DEFENSE')}]* ${cmd.description}\n\n` +
-              `• *${toSansBold('Shield Protocol')}*: ACTIVE\n` +
-              `• *${toSansBold('Target Channel')}*: ${ctx.isGroup ? ctx.groupName || 'Group' : 'Private'}\n` +
-              `• *${toSansBold('Crash Signatures')}*: 0 Violations (Clean)\n` +
-              `• *${toSansBold('Status')}*: Defense matrix operating at 100% capacity.`;
-            break;
-
-          case 'ai':
-            reply = `🧠 *[${toSansBold('TYLER MD AI')}]* ${cmd.description}\n\n` +
-              `Query: "${argsText || 'General Knowledge'}"\n\n` +
-              `• *${toSansBold('Analysis')}*: Verified by Gemini 2.5 neural model.\n` +
-              `• *${toSansBold('Synthesis')}*: Task processed with zero errors.\n` +
-              `• *${toSansBold('Next Action')}*: Ready for subsequent queries with *${ctx.config.prefix}ai*.`;
-            break;
-
-          case 'tools':
-            reply = `🛠️ *[${toSansBold('TYLER MD UTILITY')}]* ${cmd.description}\n\n` +
-              `• *${toSansBold('Input')}*: ${argsText || 'Standard Input'}\n` +
-              `• *${toSansBold('Result')}*: Operation [${toSansBold(cmd.name.toUpperCase())}] completed successfully.\n` +
-              `• *${toSansBold('Latency')}*: 12ms`;
-            break;
-
-          case 'owner':
-            reply = `👑 *[${toSansBold('SYSTEM ROOT')}]* ${cmd.description}\n\n` +
-              `• *${toSansBold('Command')}*: ${ctx.config.prefix}${toSansBold(cmd.name)}\n` +
-              `• *${toSansBold('Authorized By')}*: ${ctx.config.ownerName}\n` +
-              `• *${toSansBold('Daemon State')}*: Synchronized & operational.`;
-            break;
-
-          default:
-            reply = `⚡ *[${toSansBold(ctx.config.botName.toUpperCase())}]* ${cmd.description}\n\n` +
-              `• *${toSansBold('Command')}*: ${ctx.config.prefix}${toSansBold(cmd.name)}\n` +
-              `• *${toSansBold('Status')}*: Executed successfully by ${ctx.senderName}.`;
-            break;
-        }
-
-        return { replyText: reply };
+        return { replyText: `The ${cmd.name} command is listed but has no working handler in this build. No action was performed.${argsText ? ` Input received: ${argsText.slice(0, 120)}` : ''}` };
       });
     }
   }

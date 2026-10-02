@@ -75,6 +75,13 @@ export class AutoReplyManager {
     return this.rules.length < initialLen;
   }
 
+  public clearCustomRules(): number {
+    const defaultIds = new Set(['rule-greeting', 'rule-bot-status', 'rule-group-rules', 'rule-owner', 'rule-ping']);
+    const initialLength = this.rules.length;
+    this.rules = this.rules.filter(rule => defaultIds.has(rule.id));
+    return initialLength - this.rules.length;
+  }
+
   public toggleRule(id: string): AutoReplyRule | null {
     const rule = this.rules.find(r => r.id === id);
     if (!rule) return null;
