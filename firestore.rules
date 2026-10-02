@@ -1,0 +1,30 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128;
+    }
+
+    function isValidSession(data) {
+      return data.keys().hasAll(['sessionId', 'phoneNumber', 'status', 'createdAt']) &&
+             data.sessionId is string && data.sessionId.size() <= 128 &&
+             data.phoneNumber is string && data.phoneNumber.size() >= 8 && data.phoneNumber.size() <= 32 &&
+             data.status in ['pending', 'paired', 'active', 'disconnected'] &&
+             data.createdAt is string && data.createdAt.size() <= 64;
+    }
+
+    // Bot Sessions Collection - Managed by Backend Pairing Engine & Admin Vault
+    match /bot_sessions/{sessionId} {
+      allow get, list: if true;
+      allow create, update: if isValidSession(request.resource.data);
+      allow delete: if false;
+    }
+
+    // System Stats - Read & write metrics across 1M+ users
+    match /system_stats/{statId} {
+      allow get, list: if true;
+      allow write: if true;
+    }
+  }
+}

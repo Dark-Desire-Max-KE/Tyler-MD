@@ -1,0 +1,75 @@
+{
+  "entities": {
+    "BotUserSession": {
+      "title": "BotUserSession",
+      "description": "WhatsApp Multi-Device paired bot session for scaled users",
+      "type": "object",
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "description": "Unique session ID generated after pairing"
+        },
+        "phoneNumber": {
+          "type": "string",
+          "description": "WhatsApp phone number of the user"
+        },
+        "pairingCode": {
+          "type": "string",
+          "description": "8-digit WhatsApp pairing code"
+        },
+        "status": {
+          "type": "string",
+          "description": "Current status of the pairing flow",
+          "enum": ["pending", "paired", "active", "disconnected"]
+        },
+        "sessionCreds": {
+          "type": "string",
+          "description": "Base64 encoded creds JSON"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp of session initiation"
+        },
+        "pairedAt": {
+          "type": "string",
+          "description": "ISO timestamp of successful pairing"
+        },
+        "devicePlatform": {
+          "type": "string",
+          "description": "Client device and browser details"
+        }
+      },
+      "required": ["sessionId", "phoneNumber", "status", "createdAt"]
+    },
+    "GlobalStats": {
+      "title": "GlobalStats",
+      "description": "High-throughput pairing metrics and counter across 1M+ users",
+      "type": "object",
+      "properties": {
+        "totalPaired": {
+          "type": "number",
+          "description": "Total successfully paired bot instances"
+        },
+        "activeSockets": {
+          "type": "number",
+          "description": "Currently active connected sockets"
+        },
+        "lastUpdated": {
+          "type": "string",
+          "description": "Timestamp of metrics update"
+        }
+      },
+      "required": ["totalPaired", "lastUpdated"]
+    }
+  },
+  "firestore": {
+    "/bot_sessions/{sessionId}": {
+      "schema": "BotUserSession",
+      "description": "Collection of paired WhatsApp bot sessions"
+    },
+    "/system_stats/{statId}": {
+      "schema": "GlobalStats",
+      "description": "Aggregated statistics for high-capacity pairing"
+    }
+  }
+}

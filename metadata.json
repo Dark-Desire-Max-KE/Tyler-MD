@@ -1,0 +1,6 @@
+{
+  "name": "Tyler MD - WhatsApp Multi-Device Bot & Command Center",
+  "description": "High-performance WhatsApp Multi-Device (MD) bot powered by Baileys. Features interactive pairing, plugin engine, group management tools, automated replies, cyber-aesthetic command menus, and real-time simulator.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
